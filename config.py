@@ -56,7 +56,7 @@ class RiskConfig:
     max_position_age_hours: float = 72.0
     default_stop_loss_pct: float = 0.20
     max_daily_loss_usdc: float = 100.0
-    max_portfolio_drawndown_pct: float = 0.25
+    max_portfolio_drawdown_pct: float = 0.25
     check_interval_seconds: int = 60
 
 
