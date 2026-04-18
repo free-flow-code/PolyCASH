@@ -59,75 +59,100 @@ class TradingBot:
             discord_webhook_url=self.config.notification.discord_webhook_url,
         )
 
-        await self.notifier.send(Notification(
-            level=NotificationLevel.INFO,
-            title="🚀 Bot Starting",
-            message=f"Initializing trading bot (Paper: {self.config.strategy.paper_trading})",
-        ))
+        try:
+            await self.notifier.send(Notification(
+                level=NotificationLevel.INFO,
+                title="🚀 Bot Starting",
+                message=f"Initializing trading bot (Paper: {self.config.strategy.paper_trading})",
+            ))
 
-        # Weather API manager
-        self.weather_manager = WeatherAPIManager(
-            max_concurrent=self.config.weather.max_concurrent_requests
-        )
+            # Weather API manager
+            self.weather_manager = WeatherAPIManager(
+                max_concurrent=self.config.weather.max_concurrent_requests
+            )
 
-        # Polymarket client
-        if not self.config.polymarket.private_key and not self.config.strategy.paper_trading:
-            raise ValueError("POLYMARKET_PRIVATE_KEY required for live trading")
+            # Polymarket client
+            if not self.config.polymarket.private_key and not self.config.strategy.paper_trading:
+                raise ValueError("POLYMARKET_PRIVATE_KEY required for live trading")
 
-        self.polymarket_client = PolymarketClient(
-            private_key=self.config.polymarket.private_key,
-            funder_address=self.config.polymarket.funder_address,
-            host=self.config.polymarket.host,
-            chain_id=self.config.polymarket.chain_id,
-            signature_type=self.config.polymarket.signature_type,
-        )
-        await self.polymarket_client.initialize()
+            self.polymarket_client = PolymarketClient(
+                private_key=self.config.polymarket.private_key or "",  # Empty string for paper trading
+                funder_address=self.config.polymarket.funder_address or "0x0000000000000000000000000000000000000000",
+                host=self.config.polymarket.host,
+                chain_id=self.config.polymarket.chain_id,
+                signature_type=self.config.polymarket.signature_type,
+            )
+            await self.polymarket_client.initialize()
 
-        # Trading strategy
-        self.strategy = WeatherTradingStrategy(
-            bankroll_usdc=self.config.strategy.bankroll_usdc,
-            min_edge_threshold=self.config.strategy.min_edge_threshold,
-            kelly_multiplier=self.config.strategy.kelly_multiplier,
-            max_position_pct=self.config.strategy.max_position_pct,
-            max_daily_loss_pct=self.config.strategy.max_daily_loss_pct,
-            confidence_threshold=self.config.strategy.confidence_threshold,
-        )
+            # Trading strategy
+            self.strategy = WeatherTradingStrategy(
+                bankroll_usdc=self.config.strategy.bankroll_usdc,
+                min_edge_threshold=self.config.strategy.min_edge_threshold,
+                kelly_multiplier=self.config.strategy.kelly_multiplier,
+                max_position_pct=self.config.strategy.max_position_pct,
+                max_daily_loss_pct=self.config.strategy.max_daily_loss_pct,
+                confidence_threshold=self.config.strategy.confidence_threshold,
+            )
 
-        # Risk manager
-        self.risk_manager = RiskManager(
-            polymarket_client=self.polymarket_client,
-            max_position_age_hours=self.config.risk.max_position_age_hours,
-            default_stop_loss_pct=self.config.risk.default_stop_loss_pct,
-            max_daily_loss_usdc=self.config.risk.max_daily_loss_usdc,
-            max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
-            check_interval_seconds=self.config.risk.check_interval_seconds,
-        )
+            # Risk manager
+            self.risk_manager = RiskManager(
+                polymarket_client=self.polymarket_client,
+                max_position_age_hours=self.config.risk.max_position_age_hours,
+                default_stop_loss_pct=self.config.risk.default_stop_loss_pct,
+                max_daily_loss_usdc=self.config.risk.max_daily_loss_usdc,
+                max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
+                check_interval_seconds=self.config.risk.check_interval_seconds,
+            )
 
-        # Trading engine
-        self.trading_engine = TradingEngine(
-            polymarket_client=self.polymarket_client,
-            strategy=self.strategy,
-            weather_manager=self.weather_manager,
-            locations=self.config.weather.default_locations,
-            scan_interval_seconds=self.config.strategy.scan_interval_seconds,
-            paper_trading=self.config.strategy.paper_trading,
-        )
+            # Trading engine
+            self.trading_engine = TradingEngine(
+                polymarket_client=self.polymarket_client,
+                strategy=self.strategy,
+                weather_manager=self.weather_manager,
+                locations=self.config.weather.default_locations,
+                scan_interval_seconds=self.config.strategy.scan_interval_seconds,
+                paper_trading=self.config.strategy.paper_trading,
+            )
 
-        await self.notifier.send(Notification(
-            level=NotificationLevel.INFO,
-            title="✅ Initialization Complete",
-            message=f"Bot ready. Monitoring {len(self.config.weather.default_locations)} locations",
-        ))
+            await self.notifier.send(Notification(
+                level=NotificationLevel.INFO,
+                title="✅ Initialization Complete",
+                message=f"Bot ready. Monitoring {len(self.config.weather.default_locations)} locations",
+            ))
+
+        except Exception as e:
+            # Clean up on initialization failure
+            await self._cleanup()
+            raise
+
+    async def _cleanup(self) -> None:
+        """Clean up resources on error."""
+        if self.polymarket_client:
+            try:
+                await self.polymarket_client.close()
+            except Exception as e:
+                print(f"Error closing Polymarket client: {e}")
+        
+        if self.weather_manager:
+            try:
+                await self.weather_manager.close()
+            except Exception as e:
+                print(f"Error closing weather manager: {e}")
+        
+        if self.notifier:
+            try:
+                await self.notifier.close()
+            except Exception as e:
+                print(f"Error closing notifier: {e}")
 
     async def run(self) -> None:
         """Run the main trading loop."""
         self.running = True
 
         # Setup signal handlers for graceful shutdown
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
-
+        # Note: Windows doesn't support add_signal_handler for SIGINT/SIGTERM
+        # We handle KeyboardInterrupt in the main() function instead
+        
         # Start risk monitoring in background
         risk_task = asyncio.create_task(self._risk_monitoring_loop())
 
@@ -138,9 +163,15 @@ class TradingBot:
             await self.trading_engine.start()
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            await self.notifier.send_error(f"Trading engine error: {e}")
+            raise
         finally:
+            # Cancel background tasks
             risk_task.cancel()
             report_task.cancel()
+            
+            # Wait for tasks to finish cancellation
             await asyncio.gather(risk_task, report_task, return_exceptions=True)
 
     async def _risk_monitoring_loop(self) -> None:
@@ -183,22 +214,25 @@ class TradingBot:
             return
 
         self.running = False
-        await self.notifier.send(Notification(
-            level=NotificationLevel.WARNING,
-            title="🛑 Shutting Down",
-            message="Bot shutdown initiated",
-        ))
-
+        
+        # Stop trading engine first
         if self.trading_engine:
-            await self.trading_engine.stop()
-        if self.weather_manager:
-            await self.weather_manager.close()
-        if self.polymarket_client:
-            await self.polymarket_client.close()
-        if self.notifier:
-            await self.notifier.close()
+            self.trading_engine.running = False
+        
+        try:
+            await self.notifier.send(Notification(
+                level=NotificationLevel.WARNING,
+                title="🛑 Shutting Down",
+                message="Bot shutdown initiated",
+            ))
+        except:
+            pass
 
-        print("Bot shutdown complete.")
+        # Wait a bit for tasks to finish
+        await asyncio.sleep(1)
+        
+        await self._cleanup()
+        print("✅ Bot shutdown complete.")
 
 
 async def main() -> None:
@@ -206,9 +240,18 @@ async def main() -> None:
     bot = TradingBot(config)
     try:
         await bot.initialize()
+        
+        # Run the bot
         await bot.run()
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted by user, shutting down gracefully...")
+        await bot.shutdown()
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        await bot._cleanup()
         sys.exit(1)
 
 

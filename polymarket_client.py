@@ -81,18 +81,25 @@ class PolymarketClient:
 
     async def initialize(self) -> None:
         """Initialize CLOB client and derive API credentials."""
-        self._clob_client = ClobClient(
-            self.host,
-            key=self.private_key,
-            chain_id=self.chain_id,
-            signature_type=self.signature_type,
-            funder=self.funder_address,
-        )
-        self._clob_client.set_api_creds(
-            self._clob_client.create_or_derive_api_creds()
-        )
-        self._session = aiohttp.ClientSession()
-        logger.info("Polymarket client initialized successfully")
+        try:
+            self._clob_client = ClobClient(
+                self.host,
+                key=self.private_key,
+                chain_id=self.chain_id,
+                signature_type=self.signature_type,
+                funder=self.funder_address,
+            )
+            # Try to get existing API credentials or create new ones
+            api_creds = self._clob_client.create_or_derive_api_creds()
+            if api_creds:
+                self._clob_client.set_api_creds(api_creds)
+            self._session = aiohttp.ClientSession()
+            logger.info("Polymarket client initialized successfully")
+        except Exception as err:
+            logger.error(f"Failed to initialize Polymarket client: {err}")
+            # Don't raise, allow paper trading to continue
+            if self._session is None:
+                self._session = aiohttp.ClientSession()
 
     async def close(self) -> None:
         """Close HTTP session."""
