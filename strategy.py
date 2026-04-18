@@ -365,11 +365,17 @@ class TradingEngine:
             if signal:
                 signals.append(signal)
                 logger.info(
-                    f"Signal: {signal.signal_type.value} {signal.market.token_id} "
-                    f"Edge: {signal.edge:.3f}, Size: ${signal.position_size_usdc:.2f}"
+                    "Signal: %s %s Edge: %.3f, Size: $%.2f",
+                    signal.signal_type.value,
+                    signal.market.token_id[:8] + "...",  # Truncate token ID
+                    signal.edge,
+                    signal.position_size_usdc
                 )
 
-        await self._execute_signals(signal)
+        if signals:
+            await self._execute_signals(signals)
+        else:
+            logger.debug("No trading signals generated in this scan")
 
     async def _get_weather_markets(self) -> List[WeatherMarket]:
         """Get weather markets, using cache if fresh."""
