@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 from enum import Enum
 
-from weather_client import WeatherForecast, WeatherAPIManager
+from weather_module.weather_client import WeatherForecast, WeatherAPIManager
 from polymarket_client import PolymarketClient, WeatherMarket, OrderResult
 
 logger = logging.getLogger(__name__)
@@ -298,7 +298,6 @@ class TradingEngine:
             polymarket_client: PolymarketClient,
             strategy: WeatherTradingStrategy,
             weather_manager: WeatherAPIManager,
-            locations: List[Tuple[str, float, float]],
             scan_interval_seconds: int = 300,
             paper_trading: bool = True,
     ):
@@ -309,20 +308,21 @@ class TradingEngine:
             polymarket_client: Authenticated Polymarket client.
             strategy: Trading strategy instance.
             weather_manager: Weather api manager.
-            locations: List of (name, lan, lon) tuples to monitor.
             scan_interval_seconds: Seconds between market scans.
             paper_trading: If True, don't execute real orders.
         """
         self.polymarket = polymarket_client
         self.strategy = strategy
         self.weather_manager = weather_manager
-        self.locations = locations
         self.scan_interval = scan_interval_seconds
         self.paper_trading = paper_trading
 
         self.running = False
         self._markets_cache: List[WeatherMarket] = []
         self._last_market_update: datetime = None
+
+        # Cache for geocoded locations
+        self._geocoded_locations: Dict[str, Tuple[float, float]] = {}
 
     async def start(self) -> None:
         """Start the main trading loop."""
@@ -346,33 +346,70 @@ class TradingEngine:
 
     async def _scan_and_trade(self) -> None:
         """Perform one full scan and trading cycle."""
-        target_date = datetime.now().strftime("%Y-%m-%d")
-
-        forecasts = await self.weather_manager.fetch_all_forecasts(
-            self.locations, target_date
-        )
-
+        
+        # 1. Get all weather markets
         markets = await self._get_weather_markets()
-
+        
+        if not markets:
+            logger.debug("No weather markets found")
+            return
+        
+        # 2. Extract unique locations from markets
+        unique_locations = set()
+        for market in markets:
+            if market.location and market.location != "unknown":
+                unique_locations.add(market.location)
+        
+        # 3. Geocode locations that we haven't seen before
+        locations_to_fetch = []
+        for location in unique_locations:
+            if location not in self._geocoded_locations:
+                coords = self.polymarket.geocode_location(location)
+                if coords:
+                    self._geocoded_locations[location] = coords
+                    locations_to_fetch.append((location, coords[0], coords[1]))
+                else:
+                    logger.warning(f"Could not geocode location: {location}")
+            else:
+                coords = self._geocoded_locations[location]
+                if coords:  # Only add if geocoding succeeded
+                    locations_to_fetch.append((location, coords[0], coords[1]))
+        
+        if not locations_to_fetch:
+            logger.warning("No valid locations to fetch forecasts for")
+            return
+        
+        # 4. Fetch forecasts for all unique locations
+        target_date = datetime.now().strftime("%Y-%m-%d")
+        forecasts = await self.weather_manager.fetch_all_forecasts(
+            locations_to_fetch, target_date
+        )
+        
+        logger.info(f"Fetched forecasts for {len(forecasts)}/{len(locations_to_fetch)} locations")
+        
+        # 5. Generate signals by matching markets with forecasts
         signals = []
         for market in markets:
             if market.location not in forecasts:
                 continue
-
+            
             forecast = forecasts[market.location]
             signal = self.strategy.compute_signal(market, forecast)
-
+            
             if signal:
                 signals.append(signal)
                 logger.info(
-                    "Signal: %s %s Edge: %.3f, Size: $%.2f",
+                    "Signal: %s %s Edge: %.3f, Size: $%.2f (Conf: %.2f)",
                     signal.signal_type.value,
-                    signal.market.token_id[:8] + "...",  # Truncate token ID
+                    market.location,
                     signal.edge,
-                    signal.position_size_usdc
+                    signal.position_size_usdc,
+                    signal.confidence
                 )
-
+        
+        # 6. Execute signals
         if signals:
+            logger.info(f"Generated {len(signals)} trading signals")
             await self._execute_signals(signals)
         else:
             logger.debug("No trading signals generated in this scan")
@@ -387,6 +424,11 @@ class TradingEngine:
 
         self._markets_cache = await self.polymarket.get_weather_markets()
         self._last_market_update = datetime.now()
+
+        # Log discovered markets
+        locations = set(m.location for m in self._markets_cache if m.location != "unknown")
+        logger.info(f"Discovered {len(self._markets_cache)} weather markets in {len(locations)} locations")
+
         return self._markets_cache
 
     async def _execute_signals(self, signals: List[TradingSignal]) -> None:

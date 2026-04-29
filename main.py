@@ -18,7 +18,7 @@ from typing import Optional
 
 from config import config, AppConfig
 from logger_setup import setup_logging
-from weather_client import WeatherAPIManager
+from weather_module.weather_client import WeatherAPIManager
 from polymarket_client import PolymarketClient
 from strategy import WeatherTradingStrategy, TradingEngine
 from risk_manager import RiskManager
@@ -109,7 +109,6 @@ class TradingBot:
                 polymarket_client=self.polymarket_client,
                 strategy=self.strategy,
                 weather_manager=self.weather_manager,
-                locations=self.config.weather.default_locations,
                 scan_interval_seconds=self.config.strategy.scan_interval_seconds,
                 paper_trading=self.config.strategy.paper_trading,
             )
@@ -117,7 +116,7 @@ class TradingBot:
             await self.notifier.send(Notification(
                 level=NotificationLevel.INFO,
                 title="✅ Initialization Complete",
-                message=f"Bot ready. Monitoring {len(self.config.weather.default_locations)} locations",
+                message=f"Bot ready. Will dynamically discover weather markets.",
             ))
 
         except Exception as e:

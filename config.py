@@ -18,12 +18,6 @@ class WeatherConfig:
     """Weather API configuration."""
     cache_ttl_seconds: int = 300
     max_concurrent_requests: int = 10
-    default_locations: List[Tuple[str, float, float]] = field(default_factory=lambda: [
-        ("New York", 40.7128, -74.060),
-        ("London", 51.5074, -0.1278),
-        ("Chicago", 41.8781, -87.6298),
-        ("Los Angeles", 34.0522, -118.2437),
-    ])
 
 
 @dataclass

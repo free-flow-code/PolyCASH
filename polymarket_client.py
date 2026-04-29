@@ -1,13 +1,16 @@
 import asyncio
 import logging
-from typing import List, Optional
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
+import re
+import json
 
 import aiohttp
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
+from weather_module.locations import TEMPERATURE_STATIONS
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +21,7 @@ class WeatherMarket:
     token_id: str
     question: str
     location: str
-    market_type: str  # `high_temp`, `low_temp`, `precip`
+    market_type: str  # `high_temp`, `low_temp`
     current_price: float
     volume: float
     spread: float
@@ -111,58 +114,80 @@ class PolymarketClient:
         Discover active weather markets from Gamma API.
 
         Returns:
-             List of WeatherMarket objects for temperature and precipitation markets.
+             List of WeatherMarket objects for temperature markets.
         """
         if not self._session:
             await self.initialize()
 
         weather_markets = []
 
-        try:
-            url = f"{self.GAMMA_API_URL}/markets"
+        offset = 0
+        limit = 500  # Maximum page size
+            
+        url = f"{self.GAMMA_API_URL}/markets"
+
+        while True:
             params = {
-                "closed": "false",
-                "limit": 500,
-            }
+                    "closed": "false",
+                    "active": "true",
+                    "tag_id": 103040,  # Tag id `Daily Temperature`
+                    "limit": limit,
+                    "offset": offset,
+                }
 
-            async with self._session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                markets = await resp.json()
+            try:
+                async with self._session.get(url, params=params) as resp:
+                    resp.raise_for_status()
+                    markets_batch = await resp.json()
+                    
+                    for market in markets_batch:
+                        question = market.get("question", "").lower()
+                        print(question)
+                        if not self._is_weather_market(question):
+                            print("NOT WEATHER")
+                            continue
 
-            for market_data in markets:
-                question = market_data.get("question", "").lower()
-                if not self._is_weather_market(question):
-                    continue
+                        market_type = self._classify_weather_market(question)
+                        print(f"market_type {market_type}")
+                        location = self._extract_location(question)
+                        print(f"location {location}")
 
-                market_type = self._classify_weather_market(question)
-                location = self._extract_location(question)
+                        token_id = self._get_token_id(market)
+                        if not token_id:
+                            continue
 
-                token_id = self._get_token_id(market_data)
-                if not token_id:
-                    continue
+                        current_price = await self._get_current_price(token_id)
 
-                current_price = await self._get_current_price(token_id)
+                        weather_markets.append(
+                            WeatherMarket(
+                                token_id=token_id,
+                                question=market.get("question", ""),
+                                location=location,
+                                market_type=market_type,
+                                current_price=current_price,
+                                volume=float(market.get("volume", 0)),
+                                spread=float(market.get("spread", 0.02)),
+                                condition_id=market.get("conditionId", ""),
+                                slug=market.get("slug", ""),
+                            )
+                        )
 
-                weather_markets.append(
-                    WeatherMarket(
-                        token_id=token_id,
-                        question=market_data.get("question", ""),
-                        location=location,
-                        market_type=market_type,
-                        current_price=current_price,
-                        volume=float(market_data.get("volume", 0)),
-                        spread=float(market_data.get("spread", 0.02)),
-                        condition_id=market_data.get("conditionId", ""),
-                        slug=market_data.get("slug", ""),
-                    )
-                )
+                        if not markets_batch:
+                            # The answer is: the end of the list has been reached.
+                            break
 
-            logger.info(f"Discovered {len(weather_markets)} weather markets")
-            return weather_markets
+                        if len(markets_batch) < limit:
+                            break
+                        
+                        offset += limit
+                        await asyncio.sleep(0.5)
 
-        except Exception as err:
-            logger.error(f"Failed to fetch weather markets: {err}")
-            return []
+                logger.info(f"Discovered {len(weather_markets)} weather markets")
+                return weather_markets
+
+            except Exception as err:
+                logger.error(f"Failed to fetch weather markets: {err}")
+                return []
 
     async def place_order(
             self,
@@ -206,12 +231,12 @@ class PolymarketClient:
                 side=side_enum,
             )
 
-            # Создаём подписанный ордер
+            # Create a signed order
             signed_order = await asyncio.to_thread(
                 self._clob_client.create_order, order_args
             )
 
-            # order_type передаётся именно сюда, в post_order
+            # order_type is passed here, in post_order
             response = await asyncio.to_thread(
                 self._clob_client.create_and_post_order, signed_order, order_type
             )
@@ -265,9 +290,9 @@ class PolymarketClient:
     def _is_weather_market(question: str) -> bool:
         """Check if market question is weather-related."""
         weather_keywords = [
-            "temperature", "precipitation", "rain", "snow",
-            "high", "low", "weather", "degrees", "celsius",
-            "fahrenheit", "noaa"
+            "temperature",
+            "highest temperature",
+            "lowest temperature",
         ]
         return any(kw in question.lower() for kw in weather_keywords)
 
@@ -279,32 +304,92 @@ class PolymarketClient:
             return "high_temp"
         if "low" in q or "minimum" in q or "lowest" in q:
             return "low_temp"
-        if "precip" in q or "rain" in q or "snow" in q:
-            return "precip"
         return "unknown"
 
     @staticmethod
-    def _extract_location(question: str) -> str:
-        """Extract location name from market question."""
-        import re
-        location_patterns = [
-            r"(?:in|at|for)\s+([A-Za-z\s]+?)(?:\s+(?:on|this|will|today|tomorrow|the|have|be|temperature))",
-            r"temperature\s+(?:in|at)\s+([A-Za-z\s]+)",
-            r"([A-Za-z\s]+?)(?:'s|\s+weather|\s+temperature)",
+    def _extract_location(question: str) -> Optional[str]:
+        """
+        Extract location name from market question with improved patterns.
+        
+        Returns None if no location can be extracted.
+        """
+        question_lower = question.lower()
+        
+        # Expanded patterns for location extraction
+        patterns = [
+            # Temperature patterns
+            r"(?:temperature|high|low|temp)\s+(?:in|at|for)\s+([A-Za-z\s\-\.]+?)(?:\s+(?:on|this|will|today|tomorrow|the|have|be|reach|exceed|above|below|between|forecast|weather|degrees|°|celsius|fahrenheit|$))",
+            r"([A-Za-z\s\-\.]+?)(?:'s)?\s+(?:temperature|high|low|weather|forecast)",
+            r"(?:weather|forecast)\s+(?:in|at|for)\s+([A-Za-z\s\-\.]+)",
+            
+            # Precipitation patterns
+            r"(?:rain|snow|precipitation|rainfall)\s+(?:in|at|for)\s+([A-Za-z\s\-\.]+?)(?:\s+(?:on|this|will|today|tomorrow|the|exceed|above|total|amount|$))",
+            r"([A-Za-z\s\-\.]+?)(?:'s)?\s+(?:rain|snow|precipitation)",
+            
+            # General location patterns
+            r"(?:in|at)\s+([A-Za-z\s\-\.]+?)(?:,|\s+(?:on|for|this|will|today|tomorrow|the|have|be))",
+            r"([A-Za-z\s\-\.]+?)(?:,)\s+(?:weather|temperature|forecast)",
         ]
-
-        for pattern in location_patterns:
+        
+        for pattern in patterns:
             match = re.search(pattern, question, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                location = match.group(1).strip()
+                # Clean up the location string
+                location = re.sub(r'\s+', ' ', location)  # Normalize spaces
+                location = location.strip('.,;:-')
+                
+                # Filter out false positives
+                if location.lower() in ['will', 'today', 'tomorrow', 'weather', 'temperature', 
+                                        'forecast', 'high', 'low', 'the', 'this', 'have', 'be',
+                                        'reach', 'exceed', 'above', 'below']:
+                    continue
+                    
+                if len(location) >= 3:  # Minimum meaningful location length
+                    return location.title()
+        
+        return None
+    
+    def geocode_location(self, location: str) -> Optional[Tuple[float, float]]:
+        """
+        Gets latitude/longitude coordinates by location name.
+        
+        Pre-collected location data from PolyMarket is used..
+        """
+        if not location or location == "unknown":
+            return None
+        
+        location_data = TEMPERATURE_STATIONS.get(location, "")
 
-        return "unknown"
+        if location_data:
+            lat = location_data.get("station_lat", "")
+            lon = location_data.get("station_lon", "")
+            logger.info(f"Geocoded '{location}' -> ({lat:.4f}, {lon:.4f})")
+            return (lat, lon)
+        else:
+            logger.warning(f"Geocoding failed for '{location}'")
+            
+        return None
 
     @staticmethod
     def _get_token_id(market_data: dict) -> Optional[str]:
-        """Extract token ID from market data."""
-        if "tokens" in market_data and market_data["tokens"]:
-            return market_data["tokens"][0].get("token_id")
-        if "tokenId" in market_data:
-            return market_data["tokenId"]
-        return None
+        """Extract token ID from market data.
+
+        Each market on Polymarket is a question with a binary outcome (yes/no).
+        The server returns a list of two tokens.
+
+        - One token represents the "YES" outcome
+        (or the first possible option, e.g., "The temperature will be 21°C").
+
+        - The second token represents the "NO" outcome
+        (or the second possible option, e.g., "The temperature will not be 21°C").
+
+        The official py-clob-client library and the Polymarket platform
+        itself consistently assign the YES token as the first token in the clobTokenIds list.
+        """
+        clob_token_ids = json.loads(market_data.get("clobTokenIds"))
+
+
+        if not clob_token_ids:
+            return None
+        return clob_token_ids[0]

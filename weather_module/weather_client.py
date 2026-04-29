@@ -312,55 +312,75 @@ class OpenMeteoClient:
 class WeatherAPIManager:
     """
     Manager class for fetching weather data across multiple locations.
-
-    Handles concurrent API requests and rate limiting.
+    Now supports dynamic location discovery.
     """
 
     def __init__(self, max_concurrent: int = 10):
-        """
-        Initialize weather API manager.
-
-        Args:
-            max_concurrent: Maximum number of concorrent API requests.
-        """
         self.client = OpenMeteoClient()
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._location_cache: Dict[str, WeatherForecast] = {}
+        self._cache_timestamps: Dict[str, float] = {}
+
+    async def get_forecast_for_location(
+        self, 
+        location_name: str, 
+        latitude: float, 
+        longitude: float,
+        force_refresh: bool = False
+    ) -> Optional[WeatherForecast]:
+        """
+        Get forecast for a single location with caching.
+        """
+        target_date = datetime.now().strftime("%Y-%m-%d")
+        cache_key = f"{location_name}_{target_date}"
+        
+        # Check cache
+        if not force_refresh and cache_key in self._cache_timestamps:
+            if datetime.now().timestamp() - self._cache_timestamps[cache_key] < 300:  # 5 min TTL
+                return self._location_cache.get(cache_key)
+        
+        async with self._semaphore:
+            try:
+                forecast = await self.client.get_ensemble_forecast(
+                    latitude, longitude, location_name, target_date
+                )
+                self._location_cache[cache_key] = forecast
+                self._cache_timestamps[cache_key] = datetime.now().timestamp()
+                return forecast
+            except Exception as err:
+                logger.error(f"Failed to get forecast for {location_name}: {err}")
+                return None
 
     async def fetch_all_forecasts(
-            self,
-            locations: List[Tuple[str, float, float]],
-            target_date: str,
-    ) -> Optional[Dict[str, WeatherForecast]]:
+        self, 
+        locations: List[Tuple[str, float, float]], 
+        target_date: str
+    ) -> Dict[str, WeatherForecast]:
         """
         Fetch forecasts for multiple locations concurrently.
-
+        
         Args:
             locations: List of (location_name, latitude, longitude) tuples.
             target_date: Target date for all forecasts.
-
+            
         Returns:
-             Dictionary mapping location_name to WeatherForecast.
+            Dictionary mapping location_name to WeatherForecast.
         """
-        async def fetch_one(loc: Tuple[str, float, float]) -> Optional[WeatherForecast]:
-            async with self._semaphore:
-                try:
-                    name, lat, lon = loc
-                    return await self.client.get_ensemble_forecast(
-                        lat, lon, name, target_date
-                    )
-                except Exception as err:
-                    logger.error(f"Failed to fetch forecast for {loc[0]: {err}}")
-                    return None
-
-        tasks = [fetch_one(loc) for loc in locations]
-        results = await asyncio.gather(*tasks)
-
+        tasks = []
+        for name, lat, lon in locations:
+            task = self.get_forecast_for_location(name, lat, lon)
+            tasks.append((name, task))
+        
         forecasts = {}
-        for loc, forecast in zip(locations, results):
-            if forecast is not None:
-                forecasts[loc[0]] = forecast
-
+        for name, task in tasks:
+            try:
+                forecast = await task
+                if forecast:
+                    forecasts[name] = forecast
+            except Exception as err:
+                logger.error(f"Error fetching forecast for {name}: {err}")
+        
         return forecasts
 
     async def close(self) -> None:
